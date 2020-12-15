@@ -477,6 +477,10 @@ dbBackup *backupDb(void) {
             sizeof(server.cluster->slots_keys_count));
     }
 
+    moduleFireServerEvent(REDISMODULE_EVENT_REPL_BACKUP,
+                          REDISMODULE_SUBEVENT_REPL_BACKUP_CREATE,
+                          NULL);
+
     return backup;
 }
 
@@ -498,6 +502,10 @@ void discardDbBackup(dbBackup *buckup, int flags, void(callback)(void*)) {
     /* Release buckup. */
     zfree(buckup->dbarray);
     zfree(buckup);
+
+    moduleFireServerEvent(REDISMODULE_EVENT_REPL_BACKUP,
+                          REDISMODULE_SUBEVENT_REPL_BACKUP_DISCARD,
+                          NULL);
 }
 
 /* Restore the previously created backup (discarding what currently resides
@@ -526,6 +534,10 @@ void restoreDbBackup(dbBackup *buckup) {
     /* Release buckup. */
     zfree(buckup->dbarray);
     zfree(buckup);
+
+    moduleFireServerEvent(REDISMODULE_EVENT_REPL_BACKUP,
+                          REDISMODULE_SUBEVENT_REPL_BACKUP_RESTORE,
+                          NULL);
 }
 
 int selectDb(client *c, int id) {
@@ -604,6 +616,9 @@ void flushAllDataAndResetRDB(int flags) {
         rdbSave(server.rdb_filename,rsiptr);
         server.dirty = saved_dirty;
     }
+
+    /* Without that extra dirty++, when db was already empty, FLUSHALL will
+     * not be replicated nor put into the AOF. */
     server.dirty++;
 #if defined(USE_JEMALLOC)
     /* jemalloc 5 doesn't release pages back to the OS when there's no traffic.

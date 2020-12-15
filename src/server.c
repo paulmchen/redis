@@ -56,6 +56,7 @@
 #include <sys/utsname.h>
 #include <locale.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 
 /* Our shared "common" objects */
 
@@ -919,7 +920,7 @@ struct redisCommand redisCommandTable[] = {
 
     /* GEORADIUS has store options that may write. */
     {"georadius",georadiusCommand,-6,
-     "write @geo",
+     "write use-memory @geo",
      0,georadiusGetKeys,1,1,1,0,0,0},
 
     {"georadius_ro",georadiusroCommand,-6,
@@ -927,7 +928,7 @@ struct redisCommand redisCommandTable[] = {
      0,georadiusGetKeys,1,1,1,0,0,0},
 
     {"georadiusbymember",georadiusbymemberCommand,-5,
-     "write @geo",
+     "write use-memory @geo",
      0,georadiusGetKeys,1,1,1,0,0,0},
 
     {"georadiusbymember_ro",georadiusbymemberroCommand,-5,
@@ -945,6 +946,14 @@ struct redisCommand redisCommandTable[] = {
     {"geodist",geodistCommand,-4,
      "read-only @geo",
      0,NULL,1,1,1,0,0,0},
+
+    {"geosearch",geosearchCommand,-7,
+     "read-only @geo",
+      0,NULL,1,1,1,0,0,0},
+
+    {"geosearchstore",geosearchstoreCommand,-8,
+     "write use-memory @geo",
+      0,NULL,1,2,1,0,0,0},
 
     {"pfselftest",pfselftestCommand,1,
      "admin @hyperloglog",
@@ -2917,6 +2926,7 @@ void resetServerStats(void) {
     server.stat_active_defrag_scanned = 0;
     server.stat_fork_time = 0;
     server.stat_fork_rate = 0;
+    server.stat_total_forks = 0;
     server.stat_rejected_conn = 0;
     server.stat_sync_full = 0;
     server.stat_sync_partial_ok = 0;
@@ -4269,7 +4279,6 @@ sds genRedisInfoString(const char *section) {
     sds info = sdsempty();
     time_t uptime = server.unixtime-server.stat_starttime;
     int j;
-    struct rusage self_ru, c_ru;
     int allsections = 0, defsections = 0, everything = 0, modules = 0;
     int sections = 0;
 
@@ -4279,9 +4288,6 @@ sds genRedisInfoString(const char *section) {
     everything = strcasecmp(section,"everything") == 0;
     modules = strcasecmp(section,"modules") == 0;
     if (everything) allsections = 1;
-
-    getrusage(RUSAGE_SELF, &self_ru);
-    getrusage(RUSAGE_CHILDREN, &c_ru);
 
     /* Server */
     if (allsections || defsections || !strcasecmp(section,"server")) {
@@ -4328,6 +4334,7 @@ sds genRedisInfoString(const char *section) {
             "process_supervised:%s\r\n"
             "run_id:%s\r\n"
             "tcp_port:%i\r\n"
+            "server_time_usec:%I\r\n"
             "uptime_in_seconds:%I\r\n"
             "uptime_in_days:%I\r\n"
             "hz:%i\r\n"
@@ -4354,6 +4361,7 @@ sds genRedisInfoString(const char *section) {
             supervised,
             server.runid,
             server.port ? server.port : server.tls_port,
+            (int64_t)server.ustime,
             (int64_t)uptime,
             (int64_t)(uptime/(3600*24)),
             server.hz,
@@ -4646,6 +4654,7 @@ sds genRedisInfoString(const char *section) {
             "pubsub_channels:%ld\r\n"
             "pubsub_patterns:%lu\r\n"
             "latest_fork_usec:%lld\r\n"
+            "total_forks:%lld\r\n"
             "migrate_cached_sockets:%ld\r\n"
             "slave_expires_tracked_keys:%zu\r\n"
             "active_defrag_hits:%lld\r\n"
@@ -4682,6 +4691,7 @@ sds genRedisInfoString(const char *section) {
             dictSize(server.pubsub_channels),
             listLength(server.pubsub_patterns),
             server.stat_fork_time,
+            server.stat_total_forks,
             dictSize(server.migrate_cached_sockets),
             getSlaveKeyWithExpireCount(),
             server.stat_active_defrag_hits,
@@ -4839,6 +4849,10 @@ sds genRedisInfoString(const char *section) {
     /* CPU */
     if (allsections || defsections || !strcasecmp(section,"cpu")) {
         if (sections++) info = sdscat(info,"\r\n");
+
+        struct rusage self_ru, c_ru;
+        getrusage(RUSAGE_SELF, &self_ru);
+        getrusage(RUSAGE_CHILDREN, &c_ru);
         info = sdscatprintf(info,
         "# CPU\r\n"
         "used_cpu_sys:%ld.%06ld\r\n"
@@ -4849,6 +4863,15 @@ sds genRedisInfoString(const char *section) {
         (long)self_ru.ru_utime.tv_sec, (long)self_ru.ru_utime.tv_usec,
         (long)c_ru.ru_stime.tv_sec, (long)c_ru.ru_stime.tv_usec,
         (long)c_ru.ru_utime.tv_sec, (long)c_ru.ru_utime.tv_usec);
+#ifdef RUSAGE_THREAD
+        struct rusage m_ru;
+        getrusage(RUSAGE_THREAD, &m_ru);
+        info = sdscatprintf(info,
+            "used_cpu_sys_main_thread:%ld.%06ld\r\n"
+            "used_cpu_user_main_thread:%ld.%06ld\r\n",
+            (long)m_ru.ru_stime.tv_sec, (long)m_ru.ru_stime.tv_usec,
+            (long)m_ru.ru_utime.tv_sec, (long)m_ru.ru_utime.tv_usec);
+#endif  /* RUSAGE_THREAD */
     }
 
     /* Modules */
@@ -5180,6 +5203,7 @@ int redisFork(int purpose) {
         closeClildUnusedResourceAfterFork();
     } else {
         /* Parent */
+        server.stat_total_forks++;
         server.stat_fork_time = ustime()-start;
         server.stat_fork_rate = (double) zmalloc_used_memory() * 1000000 / server.stat_fork_time / (1024*1024*1024); /* GB per second. */
         latencyAddSampleIfNeeded("fork",server.stat_fork_time/1000);
