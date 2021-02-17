@@ -527,7 +527,7 @@ void trimReplyUnusedTailSpace(client *c) {
     listNode *ln = listLast(c->reply);
     clientReplyBlock *tail = ln? listNodeValue(ln): NULL;
 
-    /* Note that 'tail' may be NULL even if we have a tail node, becuase when
+    /* Note that 'tail' may be NULL even if we have a tail node, because when
      * addReplyDeferredLen() is used */
     if (!tail) return;
 
@@ -717,10 +717,7 @@ void addReplyLongLong(client *c, long long ll) {
 
 void addReplyAggregateLen(client *c, long length, int prefix) {
     serverAssert(length >= 0);
-    if (prefix == '*' && length < OBJ_SHARED_BULKHDR_LEN)
-        addReply(c,shared.mbulkhdr[length]);
-    else
-        addReplyLongLongWithPrefix(c,length,prefix);
+    addReplyLongLongWithPrefix(c,length,prefix);
 }
 
 void addReplyArrayLen(client *c, long length) {
@@ -781,10 +778,7 @@ void addReplyNullArray(client *c) {
 void addReplyBulkLen(client *c, robj *obj) {
     size_t len = stringObjectLen(obj);
 
-    if (len < OBJ_SHARED_BULKHDR_LEN)
-        addReply(c,shared.bulkhdr[len]);
-    else
-        addReplyLongLongWithPrefix(c,len,'$');
+    addReplyLongLongWithPrefix(c,len,'$');
 }
 
 /* Add a Redis Object as a bulk reply */
@@ -1432,7 +1426,7 @@ void freeClientAsync(client *c) {
     pthread_mutex_unlock(&async_free_queue_mutex);
 }
 
-/* Free the clietns marked as CLOSE_ASAP, return the number of clients
+/* Free the clients marked as CLOSE_ASAP, return the number of clients
  * freed. */
 int freeClientsInAsyncFreeQueue(void) {
     int freed = 0;
@@ -2439,8 +2433,10 @@ void clientCommand(client *c) {
 "    Kill connection made from <ip:port>.",
 "KILL <option> <value> [<option> <value> [...]]",
 "    Kill connections. Options are:",
-"    * ADDR <ip:port>",
-"      Kill connection made from <ip:port>",
+"    * ADDR (<ip:port>|<unixsocket>:0)",
+"      Kill connections made from the specified address",
+"    * LADDR (<ip:port>|<unixsocket>:0)",
+"      Kill connections made to specified local address",
 "    * TYPE (normal|master|replica|pubsub)",
 "      Kill connections by type.",
 "    * USER <username>",
@@ -2678,7 +2674,7 @@ NULL
                                                         c->argc == 4))
     {
         /* CLIENT PAUSE TIMEOUT [WRITE|ALL] */
-        long long duration;
+        mstime_t end;
         int type = CLIENT_PAUSE_ALL;
         if (c->argc == 4) {
             if (!strcasecmp(c->argv[3]->ptr,"write")) {
@@ -2692,9 +2688,9 @@ NULL
             }
         }
 
-        if (getTimeoutFromObjectOrReply(c,c->argv[2],&duration,
+        if (getTimeoutFromObjectOrReply(c,c->argv[2],&end,
             UNIT_MILLISECONDS) != C_OK) return;
-        pauseClients(duration, type);
+        pauseClients(end, type);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"tracking") && c->argc >= 3) {
         /* CLIENT TRACKING (on|off) [REDIRECT <id>] [BCAST] [PREFIX first]
@@ -3523,7 +3519,7 @@ int handleClientsWithPendingWritesUsingThreads(void) {
     if (processed == 0) return 0; /* Return ASAP if there are no clients. */
 
     /* If I/O threads are disabled or we have few clients to serve, don't
-     * use I/O threads, but thejboring synchronous code. */
+     * use I/O threads, but the boring synchronous code. */
     if (server.io_threads_num == 1 || stopThreadedIOIfNeeded()) {
         return handleClientsWithPendingWrites();
     }

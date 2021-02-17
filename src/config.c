@@ -624,8 +624,7 @@ void loadServerConfigFromString(char *config) {
                     err = "sentinel directive while not in sentinel mode";
                     goto loaderr;
                 }
-                err = sentinelHandleConfiguration(argv+1,argc-1);
-                if (err) goto loaderr;
+                queueSentinelConfig(argv+1,argc-1,linenum,lines[i]);
             }
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
@@ -1221,7 +1220,16 @@ struct rewriteConfigState *rewriteConfigReadOldFile(char *path) {
             sdsfree(argv[0]);
             argv[0] = alt;
         }
-        rewriteConfigAddLineNumberToOption(state,argv[0],linenum);
+        /* If this is sentinel config, we use sentinel "sentinel <config>" as option 
+            to avoid messing up the sequence. */
+        if (server.sentinel_mode && argc > 1 && !strcasecmp(argv[0],"sentinel")) {
+            sds sentinelOption = sdsempty();
+            sentinelOption = sdscatfmt(sentinelOption,"%S %S",argv[0],argv[1]);
+            rewriteConfigAddLineNumberToOption(state,sentinelOption,linenum);
+            sdsfree(sentinelOption);
+        } else {
+            rewriteConfigAddLineNumberToOption(state,argv[0],linenum);
+        }
         sdsfreesplitres(argv,argc);
     }
     fclose(fp);
@@ -2228,6 +2236,25 @@ static int isValidAOFfilename(char *val, const char **err) {
     return 1;
 }
 
+/* Validate specified string is a valid proc-title-template */
+static int isValidProcTitleTemplate(char *val, const char **err) {
+    if (!validateProcTitleTemplate(val)) {
+        *err = "template format is invalid or contains unknown variables";
+        return 0;
+    }
+    return 1;
+}
+
+static int updateProcTitleTemplate(char *val, char *prev, const char **err) {
+    UNUSED(val);
+    UNUSED(prev);
+    if (redisSetProcTitle(NULL) == C_ERR) {
+        *err = "failed to set process title";
+        return 0;
+    }
+    return 1;
+}
+
 static int updateHZ(long long val, long long prev, const char **err) {
     UNUSED(prev);
     UNUSED(err);
@@ -2380,6 +2407,7 @@ standardConfig configs[] = {
     createBoolConfig("rdb-del-sync-files", NULL, MODIFIABLE_CONFIG, server.rdb_del_sync_files, 0, NULL, NULL),
     createBoolConfig("activerehashing", NULL, MODIFIABLE_CONFIG, server.activerehashing, 1, NULL, NULL),
     createBoolConfig("stop-writes-on-bgsave-error", NULL, MODIFIABLE_CONFIG, server.stop_writes_on_bgsave_err, 1, NULL, NULL),
+    createBoolConfig("set-proc-title", NULL, IMMUTABLE_CONFIG, server.set_proc_title, 1, NULL, NULL), /* Should setproctitle be used? */
     createBoolConfig("dynamic-hz", NULL, MODIFIABLE_CONFIG, server.dynamic_hz, 1, NULL, NULL), /* Adapt hz to # of clients.*/
     createBoolConfig("lazyfree-lazy-eviction", NULL, MODIFIABLE_CONFIG, server.lazyfree_lazy_eviction, 0, NULL, NULL),
     createBoolConfig("lazyfree-lazy-expire", NULL, MODIFIABLE_CONFIG, server.lazyfree_lazy_expire, 0, NULL, NULL),
@@ -2426,6 +2454,7 @@ standardConfig configs[] = {
     createStringConfig("aof_rewrite_cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.aof_rewrite_cpulist, NULL, NULL, NULL),
     createStringConfig("bgsave_cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.bgsave_cpulist, NULL, NULL, NULL),
     createStringConfig("ignore-warnings", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.ignore_warnings, "", NULL, NULL),
+    createStringConfig("proc-title-template", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.proc_title_template, CONFIG_DEFAULT_PROC_TITLE_TEMPLATE, isValidProcTitleTemplate, updateProcTitleTemplate),
 
     /* SDS Configs */
     createSDSConfig("masterauth", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.masterauth, NULL, NULL, NULL),
