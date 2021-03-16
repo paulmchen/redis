@@ -901,7 +901,7 @@ struct redisCommand redisCommandTable[] = {
      0,NULL,0,0,0,0,0,0},
 
     {"hello",helloCommand,-1,
-     "no-auth no-script fast no-monitor ok-loading ok-stale no-slowlog @connection",
+     "no-auth no-script fast no-monitor ok-loading ok-stale @connection",
      0,NULL,0,0,0,0,0,0},
 
     /* EVAL can modify the dataset, however it is not flagged as a write
@@ -1091,7 +1091,7 @@ struct redisCommand redisCommandTable[] = {
      0,NULL,0,0,0,0,0,0},
 
     {"acl",aclCommand,-2,
-     "admin no-script no-slowlog ok-loading ok-stale",
+     "admin no-script ok-loading ok-stale",
      0,NULL,0,0,0,0,0,0},
 
     {"stralgo",stralgoCommand,-2,
@@ -3053,14 +3053,15 @@ int listenToPort(int port, socketFds *sfd) {
             sfd->fd[sfd->count] = anetTcpServer(server.neterr,port,addr,server.tcp_backlog);
         }
         if (sfd->fd[sfd->count] == ANET_ERR) {
+            int net_errno = errno;
             serverLog(LL_WARNING,
-                "Could not create server TCP listening socket %s:%d: %s",
+                "Warning: Could not create server TCP listening socket %s:%d: %s",
                 addr, port, server.neterr);
-            if (errno == EADDRNOTAVAIL && optional)
+            if (net_errno == EADDRNOTAVAIL && optional)
                 continue;
-            if (errno == ENOPROTOOPT     || errno == EPROTONOSUPPORT ||
-                errno == ESOCKTNOSUPPORT || errno == EPFNOSUPPORT ||
-                errno == EAFNOSUPPORT)
+            if (net_errno == ENOPROTOOPT     || net_errno == EPROTONOSUPPORT ||
+                net_errno == ESOCKTNOSUPPORT || net_errno == EPFNOSUPPORT ||
+                net_errno == EAFNOSUPPORT)
                 continue;
 
             /* Rollback successful listens before exiting */
@@ -3192,11 +3193,15 @@ void initServer(void) {
 
     /* Open the TCP listening socket for the user commands. */
     if (server.port != 0 &&
-        listenToPort(server.port,&server.ipfd) == C_ERR)
+        listenToPort(server.port,&server.ipfd) == C_ERR) {
+        serverLog(LL_WARNING, "Failed listening on port %u (TCP), aborting.", server.port);
         exit(1);
+    }
     if (server.tls_port != 0 &&
-        listenToPort(server.tls_port,&server.tlsfd) == C_ERR)
+        listenToPort(server.tls_port,&server.tlsfd) == C_ERR) {
+        serverLog(LL_WARNING, "Failed listening on port %u (TLS), aborting.", server.tls_port);
         exit(1);
+    }
 
     /* Open the listening Unix domain socket. */
     if (server.unixsocket != NULL) {
@@ -3619,6 +3624,12 @@ void preventCommandPropagation(client *c) {
     c->flags |= CLIENT_PREVENT_PROP;
 }
 
+/* Avoid logging any information about this client's arguments
+ * since they contain sensitive information. */
+void preventCommandLogging(client *c) {
+    c->flags |= CLIENT_PREVENT_LOGGING;
+}
+
 /* AOF specific version of preventCommandPropagation(). */
 void preventCommandAOF(client *c) {
     c->flags |= CLIENT_PREVENT_AOF_PROP;
@@ -3729,6 +3740,13 @@ void call(client *c, int flags) {
             server.lua_caller->flags |= CLIENT_FORCE_REPL;
         if (c->flags & CLIENT_FORCE_AOF)
             server.lua_caller->flags |= CLIENT_FORCE_AOF;
+    }
+
+    /* Some commands may contain sensitive data that should
+     * not be available in the slowlog. */
+    if ((c->flags & CLIENT_PREVENT_LOGGING) && !(c->flags & CLIENT_BLOCKED)) {
+        c->flags &= ~CLIENT_PREVENT_LOGGING;
+        flags &= ~CMD_CALL_SLOWLOG;
     }
 
     /* Log the command into the Slow log if needed, and populate the
@@ -3916,6 +3934,16 @@ static int cmdHasMovableKeys(struct redisCommand *cmd) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
+    if (!server.lua_timedout) {
+        /* Both EXEC and EVAL call call() directly so there should be
+         * no way in_exec or in_eval or propagate_in_transaction is 1.
+         * That is unless lua_timedout, in which case client may run
+         * some commands. */
+        serverAssert(!server.propagate_in_transaction);
+        serverAssert(!server.in_exec);
+        serverAssert(!server.in_eval);
+    }
+
     moduleCallCommandFilters(c);
 
     /* The QUIT command is handled separately. Normal command procs will
@@ -6294,10 +6322,10 @@ int main(int argc, char **argv) {
         if (server.supervised_mode == SUPERVISED_SYSTEMD) {
             if (!server.masterhost) {
                 redisCommunicateSystemd("STATUS=Ready to accept connections\n");
-                redisCommunicateSystemd("READY=1\n");
             } else {
-                redisCommunicateSystemd("STATUS=Waiting for MASTER <-> REPLICA sync\n");
+                redisCommunicateSystemd("STATUS=Ready to accept connections in read-only mode. Waiting for MASTER <-> REPLICA sync\n");
             }
+            redisCommunicateSystemd("READY=1\n");
         }
     } else {
         ACLLoadUsersAtStartup();

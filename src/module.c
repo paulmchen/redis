@@ -606,7 +606,7 @@ void moduleHandlePropagationAfterCommandCallback(RedisModuleCtx *ctx) {
      * a transaction. */
     if (!server.propagate_in_transaction) return;
 
-    /* If this command is executed from with Lua or MULTI/EXEC we do noy
+    /* If this command is executed from with Lua or MULTI/EXEC we do not
      * need to propagate EXEC */
     if (server.in_eval || server.in_exec) return;
 
@@ -1701,7 +1701,7 @@ int RM_ReplyWithLongDouble(RedisModuleCtx *ctx, long double ld) {
 void moduleReplicateMultiIfNeeded(RedisModuleCtx *ctx) {
     /* Skip this if client explicitly wrap the command with MULTI, or if
      * the module command was called by a script. */
-    if (server.lua_caller || server.in_exec) return;
+    if (server.in_eval || server.in_exec) return;
     /* If we already emitted MULTI return ASAP. */
     if (server.propagate_in_transaction) return;
     /* If this is a thread safe context, we do not want to wrap commands
@@ -2084,7 +2084,7 @@ int RM_GetContextFlags(RedisModuleCtx *ctx) {
         flags |= REDISMODULE_CTX_FLAGS_LOADING;
 
     /* Maxmemory and eviction policy */
-    if (server.maxmemory > 0) {
+    if (server.maxmemory > 0 && (!server.masterhost || !server.repl_slave_ignore_maxmemory)) {
         flags |= REDISMODULE_CTX_FLAGS_MAXMEMORY;
 
         if (server.maxmemory_policy != MAXMEMORY_NO_EVICTION)
