@@ -1161,11 +1161,9 @@ void serverLogRaw(int level, const char *msg) {
 /* Like serverLogRaw() but with printf-alike support. This is the function that
  * is used across the code. The raw version is only used in order to dump
  * the INFO output on crash. */
-void serverLog(int level, const char *fmt, ...) {
+void _serverLog(int level, const char *fmt, ...) {
     va_list ap;
     char msg[LOG_MAX_LEN];
-
-    if ((level&0xff) < server.verbosity) return;
 
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
@@ -1614,6 +1612,7 @@ void resetChildState() {
     server.child_type = CHILD_TYPE_NONE;
     server.child_pid = -1;
     server.stat_current_cow_bytes = 0;
+    server.stat_current_cow_updated = 0;
     server.stat_current_save_keys_processed = 0;
     server.stat_module_progress = 0;
     server.stat_current_save_keys_total = 0;
@@ -1929,11 +1928,11 @@ void updateCachedTime(int update_daylight_info) {
 }
 
 void checkChildrenDone(void) {
-    int statloc;
+    int statloc = 0;
     pid_t pid;
 
-    if ((pid = wait3(&statloc,WNOHANG,NULL)) != 0) {
-        int exitcode = WEXITSTATUS(statloc);
+    if ((pid = waitpid(-1, &statloc, WNOHANG)) != 0) {
+        int exitcode = WIFEXITED(statloc) ? WEXITSTATUS(statloc) : -1;
         int bysignal = 0;
 
         if (WIFSIGNALED(statloc)) bysignal = WTERMSIG(statloc);
@@ -1941,15 +1940,14 @@ void checkChildrenDone(void) {
         /* sigKillChildHandler catches the signal and calls exit(), but we
          * must make sure not to flag lastbgsave_status, etc incorrectly.
          * We could directly terminate the child process via SIGUSR1
-         * without handling it, but in this case Valgrind will log an
-         * annoying error. */
+         * without handling it */
         if (exitcode == SERVER_CHILD_NOERROR_RETVAL) {
             bysignal = SIGUSR1;
             exitcode = 1;
         }
 
         if (pid == -1) {
-            serverLog(LL_WARNING,"wait3() returned an error: %s. "
+            serverLog(LL_WARNING,"waitpid() returned an error: %s. "
                 "child_type: %s, child_pid = %d",
                 strerror(errno),
                 strChildType(server.child_type),
@@ -2657,6 +2655,7 @@ void initServerConfig(void) {
     server.aof_rewrite_scheduled = 0;
     server.aof_flush_sleep = 0;
     server.aof_last_fsync = time(NULL);
+    atomicSet(server.aof_bio_fsync_status,C_OK);
     server.aof_rewrite_time_last = -1;
     server.aof_rewrite_time_start = -1;
     server.aof_lastbgrewrite_status = C_OK;
@@ -3267,6 +3266,7 @@ void initServer(void) {
     server.stat_starttime = time(NULL);
     server.stat_peak_memory = 0;
     server.stat_current_cow_bytes = 0;
+    server.stat_current_cow_updated = 0;
     server.stat_current_save_keys_processed = 0;
     server.stat_current_save_keys_total = 0;
     server.stat_rdb_cow_bytes = 0;
@@ -3640,6 +3640,19 @@ void preventCommandReplication(client *c) {
     c->flags |= CLIENT_PREVENT_REPL_PROP;
 }
 
+/* Log the last command a client executed into the slowlog. */
+void slowlogPushCurrentCommand(client *c, struct redisCommand *cmd, ustime_t duration) {
+    /* Some commands may contain sensitive data that should not be available in the slowlog. */
+    if ((c->flags & CLIENT_PREVENT_LOGGING) || (cmd->flags & CMD_SKIP_SLOWLOG))
+        return;
+
+    /* If command argument vector was rewritten, use the original
+     * arguments. */
+    robj **argv = c->original_argv ? c->original_argv : c->argv;
+    int argc = c->original_argv ? c->original_argc : c->argc;
+    slowlogPushEntryIfNeeded(c,argv,argc,duration);
+}
+
 /* Call() is the core of Redis execution of a command.
  *
  * The following flags can be passed:
@@ -3742,34 +3755,31 @@ void call(client *c, int flags) {
             server.lua_caller->flags |= CLIENT_FORCE_AOF;
     }
 
-    /* Some commands may contain sensitive data that should
-     * not be available in the slowlog. */
-    if ((c->flags & CLIENT_PREVENT_LOGGING) && !(c->flags & CLIENT_BLOCKED)) {
-        c->flags &= ~CLIENT_PREVENT_LOGGING;
-        flags &= ~CMD_CALL_SLOWLOG;
-    }
+    /* Note: the code below uses the real command that was executed
+     * c->cmd and c->lastcmd may be different, in case of MULTI-EXEC or
+     * re-written commands such as EXPIRE, GEOADD, etc. */
 
-    /* Log the command into the Slow log if needed, and populate the
-     * per-command statistics that we show in INFO commandstats. */
-    if (flags & CMD_CALL_SLOWLOG && !(c->cmd->flags & CMD_SKIP_SLOWLOG)) {
-        char *latency_event = (c->cmd->flags & CMD_FAST) ?
-                              "fast-command" : "command";
+    /* Record the latency this command induced on the main thread.
+     * unless instructed by the caller not to log. (happens when processing
+     * a MULTI-EXEC from inside an AOF). */
+    if (flags & CMD_CALL_SLOWLOG) {
+        char *latency_event = (real_cmd->flags & CMD_FAST) ?
+                               "fast-command" : "command";
         latencyAddSampleIfNeeded(latency_event,duration/1000);
-        /* If command argument vector was rewritten, use the original
-         * arguments. */
-        robj **argv = c->original_argv ? c->original_argv : c->argv;
-        int argc = c->original_argv ? c->original_argc : c->argc;
-        /* If the client is blocked we will handle slowlog when it is unblocked . */
-        if (!(c->flags & CLIENT_BLOCKED)) {
-            slowlogPushEntryIfNeeded(c,argv,argc,duration);
-        }
     }
-    freeClientOriginalArgv(c);
 
+    /* Log the command into the Slow log if needed.
+     * If the client is blocked we will handle slowlog when it is unblocked. */
+    if ((flags & CMD_CALL_SLOWLOG) && !(c->flags & CLIENT_BLOCKED))
+        slowlogPushCurrentCommand(c, real_cmd, duration);
+
+    /* Clear the original argv.
+     * If the client is blocked we will handle slowlog when it is unblocked. */
+    if (!(c->flags & CLIENT_BLOCKED))
+        freeClientOriginalArgv(c);
+
+    /* populate the per-command statistics that we show in INFO commandstats. */
     if (flags & CMD_CALL_STATS) {
-        /* use the real command that was executed (cmd and lastamc) may be
-         * different, in case of MULTI-EXEC or re-written commands such as
-         * EXPIRE, GEOADD, etc. */
         real_cmd->microseconds += duration;
         real_cmd->calls++;
     }
@@ -4002,18 +4012,30 @@ int processCommand(client *c) {
 
     /* Check if the user can run this command according to the current
      * ACLs. */
-    int acl_keypos;
-    int acl_retval = ACLCheckCommandPerm(c,&acl_keypos);
+    int acl_errpos;
+    int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
     if (acl_retval != ACL_OK) {
-        addACLLogEntry(c,acl_retval,acl_keypos,NULL);
-        if (acl_retval == ACL_DENIED_CMD)
+        addACLLogEntry(c,acl_retval,acl_errpos,NULL);
+        switch (acl_retval) {
+        case ACL_DENIED_CMD:
             rejectCommandFormat(c,
                 "-NOPERM this user has no permissions to run "
                 "the '%s' command or its subcommand", c->cmd->name);
-        else
+            break;
+        case ACL_DENIED_KEY:
             rejectCommandFormat(c,
                 "-NOPERM this user has no permissions to access "
                 "one of the keys used as arguments");
+            break;
+        case ACL_DENIED_CHANNEL:
+            rejectCommandFormat(c,
+                "-NOPERM this user has no permissions to access "
+                "one of the channels used as arguments");
+            break;
+        default:
+            rejectCommandFormat(c, "no permission");
+            break;
+        }
         return C_OK;
     }
 
@@ -4301,7 +4323,10 @@ int prepareForShutdown(int flags) {
         /* Append only file: flush buffers and fsync() the AOF at exit */
         serverLog(LL_NOTICE,"Calling fsync() on the AOF file.");
         flushAppendOnlyFile(1);
-        redis_fsync(server.aof_fd);
+        if (redis_fsync(server.aof_fd) == -1) {
+            serverLog(LL_WARNING,"Fail to fsync the AOF file: %s.",
+                                 strerror(errno));
+        }
     }
 
     /* Create a new RDB file before exiting. */
@@ -4364,13 +4389,17 @@ int writeCommandsDeniedByDiskError(void) {
         server.lastbgsave_status == C_ERR)
     {
         return DISK_ERROR_TYPE_RDB;
-    } else if (server.aof_state != AOF_OFF &&
-               server.aof_last_write_status == C_ERR)
-    {
-        return DISK_ERROR_TYPE_AOF;
-    } else {
-        return DISK_ERROR_TYPE_NONE;
+    } else if (server.aof_state != AOF_OFF) {
+        int aof_bio_fsync_status;
+        atomicGet(server.aof_bio_fsync_status,aof_bio_fsync_status);
+        if (server.aof_last_write_status == C_ERR ||
+            aof_bio_fsync_status == C_ERR)
+        {
+            return DISK_ERROR_TYPE_AOF;
+        }
     }
+
+    return DISK_ERROR_TYPE_NONE;
 }
 
 /* The PING command. It works in a different way if the client is in
@@ -4830,11 +4859,14 @@ sds genRedisInfoString(const char *section) {
         } else if (server.stat_current_save_keys_total) {
             fork_perc = ((double)server.stat_current_save_keys_processed / server.stat_current_save_keys_total) * 100;
         }
-  
+        int aof_bio_fsync_status;
+        atomicGet(server.aof_bio_fsync_status,aof_bio_fsync_status);
+
         info = sdscatprintf(info,
             "# Persistence\r\n"
             "loading:%d\r\n"
             "current_cow_size:%zu\r\n"
+            "current_cow_size_age:%lu\r\n"
             "current_fork_perc:%.2f\r\n"
             "current_save_keys_processed:%zu\r\n"
             "current_save_keys_total:%zu\r\n"
@@ -4857,6 +4889,7 @@ sds genRedisInfoString(const char *section) {
             "module_fork_last_cow_size:%zu\r\n",
             (int)server.loading,
             server.stat_current_cow_bytes,
+            server.stat_current_cow_updated ? (unsigned long) elapsedMs(server.stat_current_cow_updated) / 1000 : 0,
             fork_perc,
             server.stat_current_save_keys_processed,
             server.stat_current_save_keys_total,
@@ -4875,7 +4908,8 @@ sds genRedisInfoString(const char *section) {
             (intmax_t)((server.child_type != CHILD_TYPE_AOF) ?
                 -1 : time(NULL)-server.aof_rewrite_time_start),
             (server.aof_lastbgrewrite_status == C_OK) ? "ok" : "err",
-            (server.aof_last_write_status == C_OK) ? "ok" : "err",
+            (server.aof_last_write_status == C_OK &&
+                aof_bio_fsync_status == C_OK) ? "ok" : "err",
             server.stat_aof_cow_bytes,
             server.child_type == CHILD_TYPE_MODULE,
             server.stat_module_cow_bytes);
@@ -5087,9 +5121,11 @@ sds genRedisInfoString(const char *section) {
             }
             info = sdscatprintf(info,
                 "slave_priority:%d\r\n"
-                "slave_read_only:%d\r\n",
+                "slave_read_only:%d\r\n"
+                "replica_announced:%d\r\n",
                 server.slave_priority,
-                server.repl_slave_ro);
+                server.repl_slave_ro,
+                server.replica_announced);
         }
 
         info = sdscatprintf(info,
@@ -5829,6 +5865,7 @@ int redisFork(int purpose) {
             server.child_pid = childpid;
             server.child_type = purpose;
             server.stat_current_cow_bytes = 0;
+            server.stat_current_cow_updated = 0;
             server.stat_current_save_keys_processed = 0;
             server.stat_module_progress = 0;
             server.stat_current_save_keys_total = dbTotalServerKeyCount();
@@ -6221,7 +6258,6 @@ int main(int argc, char **argv) {
             server.exec_argv[1] = zstrdup(server.configfile);
             j = 2; // Skip this arg when parsing options
         }
-
         while(j < argc) {
             /* Either first or last argument - Should we read config from stdin? */
             if (argv[j][0] == '-' && argv[j][1] == '\0' && (j == 1 || j == argc-1)) {
@@ -6244,16 +6280,11 @@ int main(int argc, char **argv) {
             j++;
         }
 
-        if (server.sentinel_mode && ! server.configfile) {
-            serverLog(LL_WARNING,
-                "Sentinel needs config file on disk to save state.  Exiting...");
-            exit(1);
-        }
         loadServerConfig(server.configfile, config_from_stdin, options);
         if (server.sentinel_mode) loadSentinelConfigFromQueue();
         sdsfree(options);
     }
-
+    if (server.sentinel_mode) sentinelCheckConfigFile();
     server.supervised = redisIsSupervised(server.supervised_mode);
     int background = server.daemonize && !server.supervised;
     if (background) daemonize();

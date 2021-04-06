@@ -130,6 +130,11 @@ typedef long long ustime_t; /* microsecond time type. */
  * special code. */
 #define SERVER_CHILD_NOERROR_RETVAL    255
 
+/* Reading copy-on-write info is sometimes expensive and may slow down child
+ * processes that report it continuously. We measure the cost of obtaining it
+ * and hold back additional reading based on this factor. */
+#define CHILD_COW_DUTY_CYCLE           100
+
 /* Instantaneous metrics tracking. */
 #define STATS_METRIC_SAMPLES 16     /* Number of samples per metric. */
 #define STATS_METRIC_COMMAND 0      /* Number of commands executed. */
@@ -1114,8 +1119,10 @@ typedef struct socketFds {
 typedef struct redisTLSContextConfig {
     char *cert_file;                /* Server side and optionally client side cert file name */
     char *key_file;                 /* Private key filename for cert_file */
+    char *key_file_pass;            /* Optional password for key_file */
     char *client_cert_file;         /* Certificate to use as a client; if none, use cert_file */
     char *client_key_file;          /* Private key filename for client_cert_file */
+    char *client_key_file_pass;     /* Optional password for client_key_file */
     char *dh_params_file;
     char *ca_cert_file;
     char *ca_cert_dir;
@@ -1279,6 +1286,7 @@ struct redisServer {
     redisAtomic long long stat_net_input_bytes; /* Bytes read from network. */
     redisAtomic long long stat_net_output_bytes; /* Bytes written to network. */
     size_t stat_current_cow_bytes;  /* Copy on write bytes while child is active. */
+    monotime stat_current_cow_updated;  /* Last update time of stat_current_cow_bytes */
     size_t stat_current_save_keys_processed;  /* Processed keys while child is active. */
     size_t stat_current_save_keys_total;  /* Number of keys when child started. */
     size_t stat_rdb_cow_bytes;      /* Copy on write bytes during RDB saving. */
@@ -1354,6 +1362,7 @@ struct redisServer {
     int aof_last_write_errno;       /* Valid if aof_last_write_status is ERR */
     int aof_load_truncated;         /* Don't stop on unexpected AOF EOF. */
     int aof_use_rdb_preamble;       /* Use RDB preamble on AOF rewrites. */
+    redisAtomic int aof_bio_fsync_status; /* Status of AOF fsync in bio job. */
     /* AOF pipes used to communicate between parent and child during rewrite. */
     int aof_pipe_write_data_to_child;
     int aof_pipe_read_data_from_parent;
@@ -1460,6 +1469,7 @@ struct redisServer {
     time_t repl_down_since; /* Unix time at which link with master went down */
     int repl_disable_tcp_nodelay;   /* Disable TCP_NODELAY after SYNC? */
     int slave_priority;             /* Reported in INFO and used by Sentinel. */
+    int replica_announced;          /* If true, replica is announced by Sentinel */
     int slave_announce_port;        /* Give the master this listening port. */
     char *slave_announce_ip;        /* Give the master this ip address. */
     /* The following two fields is where we store master PSYNC replid/offset
@@ -1533,6 +1543,7 @@ struct redisServer {
     char *cluster_configfile; /* Cluster auto-generated config file name. */
     struct clusterState *cluster;  /* State of the cluster */
     int cluster_migration_barrier; /* Cluster replicas migration barrier. */
+    int cluster_allow_replica_migration; /* Automatic replica migrations to orphaned masters and from empty masters */
     int cluster_slave_validity_factor; /* Slave max data age for failover. */
     int cluster_require_full_coverage; /* If true, put the cluster down if
                                           there is at least an uncovered slot.*/
@@ -1540,6 +1551,7 @@ struct redisServer {
                                        if the master is in failure state. */
     char *cluster_announce_ip;  /* IP address to announce on cluster bus. */
     int cluster_announce_port;     /* base port to announce on cluster bus. */
+    int cluster_announce_tls_port; /* TLS port to announce on cluster bus. */
     int cluster_announce_bus_port; /* bus port to announce on cluster bus. */
     int cluster_module_flags;      /* Set of flags that Redis modules are able
                                       to set in order to suppress certain
@@ -1584,7 +1596,7 @@ struct redisServer {
     sds requirepass;              /* Remember the cleartext password set with
                                      the old "requirepass" directive for
                                      backward compatibility with Redis <= 5. */
-    int acl_pubusub_default;      /* Default ACL pub/sub channels flag */
+    int acl_pubsub_default;      /* Default ACL pub/sub channels flag */
     /* Assert & bug reporting */
     int watchdog_period;  /* Software watchdog period in ms. 0 = off */
     /* System hardware info */
@@ -2084,7 +2096,7 @@ int isMutuallyExclusiveChildType(int type);
 extern rax *Users;
 extern user *DefaultUser;
 void ACLInit(void);
-/* Return values for ACLCheckCommandPerm() and ACLCheckPubsubPerm(). */
+/* Return values for ACLCheckAllPerm(). */
 #define ACL_OK 0
 #define ACL_DENIED_CMD 1
 #define ACL_DENIED_KEY 2
@@ -2095,8 +2107,7 @@ int ACLAuthenticateUser(client *c, robj *username, robj *password);
 unsigned long ACLGetCommandID(const char *cmdname);
 void ACLClearCommandID(void);
 user *ACLGetUserByName(const char *name, size_t namelen);
-int ACLCheckCommandPerm(client *c, int *keyidxptr);
-int ACLCheckPubsubPerm(client *c, int idx, int count, int literal, int *idxptr);
+int ACLCheckAllPerm(client *c, int *idxptr);
 int ACLSetUser(user *u, const char *op, ssize_t oplen);
 sds ACLDefaultUserFirstPassword(void);
 uint64_t ACLGetCommandCategoryFlagByName(const char *name);
@@ -2200,12 +2211,13 @@ void preventCommandPropagation(client *c);
 void preventCommandLogging(client *c);
 void preventCommandAOF(client *c);
 void preventCommandReplication(client *c);
+void slowlogPushCurrentCommand(client *c, struct redisCommand *cmd, ustime_t duration);
 int prepareForShutdown(int flags);
 #ifdef __GNUC__
-void serverLog(int level, const char *fmt, ...)
+void _serverLog(int level, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 #else
-void serverLog(int level, const char *fmt, ...);
+void _serverLog(int level, const char *fmt, ...);
 #endif
 void serverLogRaw(int level, const char *msg);
 void serverLogFromHandler(int level, const char *msg);
@@ -2394,6 +2406,7 @@ const char *sentinelHandleConfiguration(char **argv, int argc);
 void queueSentinelConfig(sds *argv, int argc, int linenum, sds line);
 void loadSentinelConfigFromQueue(void);
 void sentinelIsRunning(void);
+void sentinelCheckConfigFile(void);
 
 /* redis-check-rdb & aof */
 int redis_check_rdb(char *rdbfilename, FILE *fp);
@@ -2710,6 +2723,13 @@ void debugDelay(int usec);
 void killIOThreads(void);
 void killThreads(void);
 void makeThreadKillable(void);
+
+/* Use macro for checking log level to avoid evaluating arguments in cases log
+ * should be ignored due to low level. */
+#define serverLog(level, ...) do {\
+        if (((level)&0xff) < server.verbosity) break;\
+        _serverLog(level, __VA_ARGS__);\
+    } while(0)
 
 /* TLS stuff */
 void tlsInit(void);
