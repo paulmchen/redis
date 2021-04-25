@@ -2421,8 +2421,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         server.get_ack_from_slaves = 0;
     }
 
-    /* We may have recieved updates from clients about their current offset. NOTE:
-     * this can't be done where the ACK is recieved since failover will disconnect 
+    /* We may have received updates from clients about their current offset. NOTE:
+     * this can't be done where the ACK is received since failover will disconnect 
      * our clients. */
     updateFailoverStatus();
 
@@ -4390,11 +4390,14 @@ int writeCommandsDeniedByDiskError(void) {
     {
         return DISK_ERROR_TYPE_RDB;
     } else if (server.aof_state != AOF_OFF) {
+        if (server.aof_last_write_status == C_ERR) {
+            return DISK_ERROR_TYPE_AOF;
+        }
+        /* AOF fsync error. */
         int aof_bio_fsync_status;
         atomicGet(server.aof_bio_fsync_status,aof_bio_fsync_status);
-        if (server.aof_last_write_status == C_ERR ||
-            aof_bio_fsync_status == C_ERR)
-        {
+        if (aof_bio_fsync_status == C_ERR) {
+            atomicGet(server.aof_bio_fsync_errno,server.aof_last_write_errno);
             return DISK_ERROR_TYPE_AOF;
         }
     }
@@ -5117,7 +5120,8 @@ sds genRedisInfoString(const char *section) {
             if (server.repl_state != REPL_STATE_CONNECTED) {
                 info = sdscatprintf(info,
                     "master_link_down_since_seconds:%jd\r\n",
-                    (intmax_t)(server.unixtime-server.repl_down_since));
+                    server.repl_down_since ?
+                    (intmax_t)(server.unixtime-server.repl_down_since) : -1);
             }
             info = sdscatprintf(info,
                 "slave_priority:%d\r\n"
@@ -6299,7 +6303,7 @@ int main(int argc, char **argv) {
             (int)getpid());
 
     if (argc == 1) {
-        serverLog(LL_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use %s /path/to/%s.conf", argv[0], server.sentinel_mode ? "sentinel" : "redis");
+        serverLog(LL_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use %s /path/to/redis.conf", argv[0]);
     } else {
         serverLog(LL_WARNING, "Configuration loaded");
     }

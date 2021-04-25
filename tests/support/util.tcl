@@ -31,7 +31,7 @@ proc zlistAlikeSort {a b} {
 
 # Return all log lines starting with the first line that contains a warning.
 # Generally, this will be an assertion error with a stack trace.
-proc warnings_from_file {filename} {
+proc crashlog_from_file {filename} {
     set lines [split [exec cat $filename] "\n"]
     set matched 0
     set logall 0
@@ -641,6 +641,12 @@ proc generate_fuzzy_traffic_on_key {key duration} {
             r {*}$cmd
         } err ] } {
             incr succeeded
+        } else {
+            set err [format "%s" $err] ;# convert to string for pattern matching
+            if {[string match "*SIGTERM*" $err]} {
+                puts "command caused test to hang? $cmd"
+                exit 1
+            }
         }
     }
 
@@ -712,4 +718,53 @@ proc chi_square_value {res} {
     }
 
     return $x2_value
+}
+
+#subscribe to Pub/Sub channels
+proc consume_subscribe_messages {client type channels} {
+    set numsub -1
+    set counts {}
+
+    for {set i [llength $channels]} {$i > 0} {incr i -1} {
+        set msg [$client read]
+        assert_equal $type [lindex $msg 0]
+
+        # when receiving subscribe messages the channels names
+        # are ordered. when receiving unsubscribe messages
+        # they are unordered
+        set idx [lsearch -exact $channels [lindex $msg 1]]
+        if {[string match "*unsubscribe" $type]} {
+            assert {$idx >= 0}
+        } else {
+            assert {$idx == 0}
+        }
+        set channels [lreplace $channels $idx $idx]
+
+        # aggregate the subscription count to return to the caller
+        lappend counts [lindex $msg 2]
+    }
+
+    # we should have received messages for channels
+    assert {[llength $channels] == 0}
+    return $counts
+}
+
+proc subscribe {client channels} {
+    $client subscribe {*}$channels
+    consume_subscribe_messages $client subscribe $channels
+}
+
+proc unsubscribe {client {channels {}}} {
+    $client unsubscribe {*}$channels
+    consume_subscribe_messages $client unsubscribe $channels
+}
+
+proc psubscribe {client channels} {
+    $client psubscribe {*}$channels
+    consume_subscribe_messages $client psubscribe $channels
+}
+
+proc punsubscribe {client {channels {}}} {
+    $client punsubscribe {*}$channels
+    consume_subscribe_messages $client punsubscribe $channels
 }

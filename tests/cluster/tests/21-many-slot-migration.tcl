@@ -1,5 +1,10 @@
 # Tests for many simlutaneous migrations.
 
+# TODO: Test is currently disabled until it is stabilized (fixing the test
+# itself or real issues in Redis).
+
+if {false} {
+
 source "../tests/includes/init-tests.tcl"
 source "../tests/includes/utils.tcl"
 
@@ -9,6 +14,7 @@ source "../tests/includes/utils.tcl"
 
 test "Create a 10 nodes cluster" {
     create_cluster 10 0
+    config_set_all_nodes cluster-allow-replica-migration no
 }
 
 test "Cluster is up" {
@@ -54,3 +60,5 @@ test "Keys are accessible" {
     }
 }
 
+config_set_all_nodes cluster-allow-replica-migration yes
+}

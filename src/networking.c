@@ -154,6 +154,7 @@ client *createClient(connection *conn) {
     c->read_reploff = 0;
     c->repl_ack_off = 0;
     c->repl_ack_time = 0;
+    c->repl_last_partial_write = 0;
     c->slave_listening_port = 0;
     c->slave_addr = NULL;
     c->slave_capa = SLAVE_CAPA_NONE;
@@ -1550,9 +1551,7 @@ int writeToClient(client *c, int handler_installed) {
     }
     atomicIncr(server.stat_net_output_bytes, totwritten);
     if (nwritten == -1) {
-        if (connGetState(c->conn) == CONN_STATE_CONNECTED) {
-            nwritten = 0;
-        } else {
+        if (connGetState(c->conn) != CONN_STATE_CONNECTED) {
             serverLog(LL_VERBOSE,
                 "Error writing to client: %s", connGetLastError(c->conn));
             freeClientAsync(c);
@@ -3332,6 +3331,8 @@ int areClientsPaused(void) {
  * if it has. Also returns true if clients are now paused and false 
  * otherwise. */
 int checkClientPauseTimeoutAndReturnIfPaused(void) {
+    if (!areClientsPaused())
+        return 0;
     if (server.client_pause_end_time < server.mstime) {
         unpauseClients();
     }

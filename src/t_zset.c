@@ -1636,7 +1636,7 @@ static int _zsetZiplistValidateIntegrity(unsigned char *p, void *userdata) {
     return 1;
 }
 
-/* Validate the integrity of the data stracture.
+/* Validate the integrity of the data structure.
  * when `deep` is 0, only the integrity of the header is validated.
  * when `deep` is 1, we scan all the entries one by one. */
 int zsetZiplistValidateIntegrity(unsigned char *zl, size_t size, int deep) {
@@ -2576,8 +2576,8 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         return;
 
     if (setnum < 1) {
-        addReplyError(c,
-            "at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE");
+        addReplyErrorFormat(c,
+            "at least 1 input key is needed for %s", c->cmd->name);
         return;
     }
 
