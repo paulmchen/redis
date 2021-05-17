@@ -910,8 +910,16 @@ struct redisCommand redisCommandTable[] = {
      "no-script may-replicate @scripting",
      0,evalGetKeys,0,0,0,0,0,0},
 
+    {"eval_ro",evalRoCommand,-3,
+     "no-script @scripting",
+     0,evalGetKeys,0,0,0,0,0,0},
+
     {"evalsha",evalShaCommand,-3,
      "no-script may-replicate @scripting",
+     0,evalGetKeys,0,0,0,0,0,0},
+
+    {"evalsha_ro",evalShaRoCommand,-3,
+     "no-script @scripting",
      0,evalGetKeys,0,0,0,0,0,0},
 
     {"slowlog",slowlogCommand,-2,
@@ -3119,6 +3127,7 @@ void resetServerStats(void) {
     server.stat_total_error_replies = 0;
     server.stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
+    lazyfreeResetStats();
 }
 
 /* Make the thread killable at any time, so that kill threads functions
