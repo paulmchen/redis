@@ -33,6 +33,8 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <glob.h>
+#include <string.h>
 
 /*-----------------------------------------------------------------------------
  * Config file name-value maps.
@@ -485,26 +487,13 @@ void loadServerConfigFromString(char *config) {
             }
         } else if (!strcasecmp(argv[0],"dir") && argc == 2) {
             if (chdir(argv[1]) == -1) {
-                serverLog(LL_WARNING,"Can't chdir to '%s': %s",
-                    argv[1], strerror(errno));
-                exit(1);
+                err = sdscatprintf(sdsempty(), "Can't chdir to '%s': %s",
+                                   argv[1], strerror(errno));
+                goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"logfile") && argc == 2) {
-            FILE *logfp;
-
             zfree(server.logfile);
             server.logfile = zstrdup(argv[1]);
-            if (server.logfile[0] != '\0') {
-                /* Test if we are able to open the file. The server will not
-                 * be able to abort just for this problem later... */
-                logfp = fopen(server.logfile,"a");
-                if (logfp == NULL) {
-                    err = sdscatprintf(sdsempty(),
-                        "Can't open the log file: %s", strerror(errno));
-                    goto loaderr;
-                }
-                fclose(logfp);
-            }
         } else if (!strcasecmp(argv[0],"include") && argc == 2) {
             loadServerConfig(argv[1], 0, NULL);
         } else if ((!strcasecmp(argv[0],"slaveof") ||
@@ -613,6 +602,20 @@ void loadServerConfigFromString(char *config) {
         sdsfreesplitres(argv,argc);
     }
 
+    if (server.logfile[0] != '\0') {
+        FILE *logfp;
+
+        /* Test if we are able to open the file. The server will not
+         * be able to abort just for this problem later... */
+        logfp = fopen(server.logfile,"a");
+        if (logfp == NULL) {
+            err = sdscatprintf(sdsempty(),
+                               "Can't open the log file: %s", strerror(errno));
+            goto loaderr;
+        }
+        fclose(logfp);
+    }
+
     /* Sanity checks. */
     if (server.cluster_enabled && server.masterhost) {
         linenum = slaveof_linenum;
@@ -648,19 +651,58 @@ void loadServerConfig(char *filename, char config_from_stdin, char *options) {
     sds config = sdsempty();
     char buf[CONFIG_MAX_LINE+1];
     FILE *fp;
+    glob_t globbuf;
 
     /* Load the file content */
     if (filename) {
-        if ((fp = fopen(filename,"r")) == NULL) {
-            serverLog(LL_WARNING,
-                    "Fatal error, can't open config file '%s': %s",
-                    filename, strerror(errno));
-            exit(1);
+
+        /* The logic for handling wildcards has slightly different behavior in cases where
+         * there is a failure to locate the included file.
+         * Whether or not a wildcard is specified, we should ALWAYS log errors when attempting
+         * to open included config files.
+         *
+         * However, we desire a behavioral difference between instances where a wildcard was
+         * specified and those where it hasn't:
+         *      no wildcards   : attempt to open the specified file and fail with a logged error
+         *                       if the file cannot be found and opened.
+         *      with wildcards : attempt to glob the specified pattern; if no files match the
+         *                       pattern, then gracefully continue on to the next entry in the
+         *                       config file, as if the current entry was never encountered.
+         *                       This will allow for empty conf.d directories to be included. */
+
+        if (strchr(filename, '*') || strchr(filename, '?') || strchr(filename, '[')) {
+            /* A wildcard character detected in filename, so let us use glob */
+            if (glob(filename, 0, NULL, &globbuf) == 0) {
+
+                for (size_t i = 0; i < globbuf.gl_pathc; i++) {
+                    if ((fp = fopen(globbuf.gl_pathv[i], "r")) == NULL) {
+                        serverLog(LL_WARNING,
+                                  "Fatal error, can't open config file '%s': %s",
+                                  globbuf.gl_pathv[i], strerror(errno));
+                        exit(1);
+                    }
+                    while(fgets(buf,CONFIG_MAX_LINE+1,fp) != NULL)
+                        config = sdscat(config,buf);
+                    fclose(fp);
+                }
+
+                globfree(&globbuf);
+            }
+        } else {
+            /* No wildcard in filename means we can use the original logic to read and
+             * potentially fail traditionally */
+            if ((fp = fopen(filename, "r")) == NULL) {
+                serverLog(LL_WARNING,
+                          "Fatal error, can't open config file '%s': %s",
+                          filename, strerror(errno));
+                exit(1);
+            }
+            while(fgets(buf,CONFIG_MAX_LINE+1,fp) != NULL)
+                config = sdscat(config,buf);
+            fclose(fp);
         }
-        while(fgets(buf,CONFIG_MAX_LINE+1,fp) != NULL)
-            config = sdscat(config,buf);
-        fclose(fp);
     }
+
     /* Append content from stdin */
     if (config_from_stdin) {
         serverLog(LL_WARNING,"Reading config from stdin");
@@ -1030,7 +1072,7 @@ void configGetCommand(client *c) {
         matches++;
     }
 
-    if (stringmatch(pattern,"oom-score-adj-values",0)) {
+    if (stringmatch(pattern,"oom-score-adj-values",1)) {
         sds buf = sdsempty();
         int j;
 
@@ -1058,9 +1100,6 @@ void configGetCommand(client *c) {
 /* We use the following dictionary type to store where a configuration
  * option is mentioned in the old configuration file, so it's
  * like "maxmemory" -> list of line numbers (first line is zero). */
-uint64_t dictSdsCaseHash(const void *key);
-int dictSdsKeyCaseCompare(void *privdata, const void *key1, const void *key2);
-void dictSdsDestructor(void *privdata, void *val);
 void dictListDestructor(void *privdata, void *val);
 
 /* Sentinel config rewriting is implemented inside sentinel.c by
@@ -2438,7 +2477,6 @@ standardConfig configs[] = {
     createBoolConfig("lazyfree-lazy-user-flush", NULL, MODIFIABLE_CONFIG, server.lazyfree_lazy_user_flush , 0, NULL, NULL),
     createBoolConfig("repl-disable-tcp-nodelay", NULL, MODIFIABLE_CONFIG, server.repl_disable_tcp_nodelay, 0, NULL, NULL),
     createBoolConfig("repl-diskless-sync", NULL, MODIFIABLE_CONFIG, server.repl_diskless_sync, 0, NULL, NULL),
-    createBoolConfig("gopher-enabled", NULL, MODIFIABLE_CONFIG, server.gopher_enabled, 0, NULL, NULL),
     createBoolConfig("aof-rewrite-incremental-fsync", NULL, MODIFIABLE_CONFIG, server.aof_rewrite_incremental_fsync, 1, NULL, NULL),
     createBoolConfig("no-appendfsync-on-rewrite", NULL, MODIFIABLE_CONFIG, server.aof_no_fsync_on_rewrite, 0, NULL, NULL),
     createBoolConfig("cluster-require-full-coverage", NULL, MODIFIABLE_CONFIG, server.cluster_require_full_coverage, 1, NULL, NULL),
